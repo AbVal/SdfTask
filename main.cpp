@@ -33,8 +33,8 @@ using LiteMath::uint4;
 
 float EPS_GRAD = 1e-8;
 float EPS_MARCH = 1e-3;
-float MAX_MARCH_ITERATIONS = 10;
-float MAX_MARCH_DIST = 5;
+float MAX_MARCH_ITERATIONS = 75;
+float MAX_MARCH_DIST = 12;
 
 struct SdfGrid
 {
@@ -242,6 +242,23 @@ struct Sphere : SceneObject
     }
 };
 
+struct Box : SceneObject
+{
+    float dist;
+    Box(float3 pos, uint32_t color, Material material, float dist)
+    {
+        this->pos = pos;
+        this->color = color;
+        this->material = material;
+        this->dist = dist;
+    }
+
+    float distance(float3 p) override
+    {
+        return hmax(p - this->pos) - this->dist;
+    }
+};
+
 struct Plane : SceneObject
 {
     float a, b, c, d;
@@ -269,6 +286,98 @@ struct Plane : SceneObject
     }
 };
 
+bool checkBounds(float3 point)
+{
+    if (point.x < -1 || point.x > 1) {
+        return false;
+    }
+    if (point.y < -1 || point.y > 1) {
+        return false;
+    }
+    if (point.z < -1 || point.z > 1) {
+        return false;
+    }
+    return true;
+}
+
+bool checkGridBounds(float3 point, const SdfGrid &grid)
+{
+    if (point.x < 0 || point.x > grid.size.x - 1) {
+        return false;
+    }
+    if (point.y < 0 || point.y > grid.size.y - 1) {
+        return false;
+    }
+    if (point.z < 0 || point.z > grid.size.z - 1) {
+        return false;
+    }
+    return true;
+}
+
+float gridIndex(const SdfGrid &grid, int x, int y, int z)
+{
+    // std::cout << "gridIndex" << std::endl;
+    // std::cout << x << std::endl;
+    // std::cout << y << std::endl;
+    // std::cout << z << std::endl;
+    return grid.data[x + y * grid.size.x + z * grid.size.x * grid.size.y];
+}
+
+float trilinearInterpolation(float3 point, const SdfGrid &grid)
+{
+    if (!checkBounds(point))
+    {
+        return hmax(abs(point)) - 1;
+    }
+    // std::cout << "trilinearInterpolation" << std::endl;
+    float3 point_scaled = (point + 1) * float3(grid.size.x, grid.size.y, grid.size.z) / 2;
+    if (!checkGridBounds(point_scaled, grid))
+    {
+        return 999;
+    }
+    int3 lb = (int3) floor(point_scaled);
+    int3 ub = (int3) ceil(point_scaled);
+    ub.x += (ub.x == lb.x);
+    ub.y += (ub.y == lb.y);
+    ub.z += (ub.z == lb.z);
+    float x, y, z;
+    
+    // std::cout << point_scaled.x << std::endl;
+    // std::cout << point_scaled.y << std::endl;
+    // std::cout << point_scaled.z << std::endl;
+    // std::cout << std::endl;
+    // std::cout << std::endl;
+    // std::cout << std::endl;
+
+
+    x = (point_scaled.x - lb.x) / (ub.x - lb.x);
+    y = (point_scaled.y - lb.y) / (ub.y - lb.y);
+    z = (point_scaled.z - lb.z) / (ub.z - lb.z);
+    float c00 = gridIndex(grid, lb.x, lb.y, lb.z) * (1 - x) + gridIndex(grid, ub.x, lb.y, lb.z) * x;
+    float c01 = gridIndex(grid, lb.x, lb.y, ub.z) * (1 - x) + gridIndex(grid, ub.x, lb.y, ub.z) * x;
+    float c10 = gridIndex(grid, lb.x, ub.y, lb.z) * (1 - x) + gridIndex(grid, ub.x, ub.y, lb.z) * x;
+    float c11 = gridIndex(grid, lb.x, ub.y, ub.z) * (1 - x) + gridIndex(grid, ub.x, ub.y, ub.z) * x;
+    float c0 = c00 * (1 - y) + c10 * y;
+    float c1 = c01 * (1 - y) + c11 * y;
+    return c0 * (1 - z) + c1 * z;
+}
+
+struct SdfGridObject : SceneObject
+{
+    SdfGrid grid;
+    SdfGridObject(SdfGrid grid, uint32_t color, Material material)
+    {
+        this->grid = grid;
+        this->color = color;
+        this->material = material;
+    }
+
+    float distance(float3 p) override
+    {
+        return trilinearInterpolation(p, this->grid);
+    }
+};
+
 struct LightingObject
 {
     float3 pos;
@@ -291,13 +400,27 @@ struct DirectionalLight : LightingObject
 
 Hit March(const Ray &ray, SceneObject& object)
 {
+    // std::cout << "March" << std::endl;
     float3 start(ray.pos);
+    bool firstHit = true;
+    if (hmax(abs(start)) < 1)
+    {
+        firstHit = false;
+    }
     float length = 0.0;
     for (int i = 0; i < MAX_MARCH_ITERATIONS; i++)
     {
         float3 point = start + length * ray.dir;
         float distance = object.distance(point);
         if (distance < EPS_MARCH) {
+            if (firstHit) {
+                start += 1.2 * length * ray.dir;
+                length = 0;
+                firstHit = false;
+                // length += 1e-3;
+                continue;
+            }
+            else if (hmax(abs(point)) > 1) break;
             return Hit(length, object.color, object.material);
         }
         length += distance;
@@ -313,6 +436,7 @@ Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene,
     bestHit.exist = false;
     for (SceneObject* object : scene)
     {
+        // TODO: move marching into object interface
         Hit objectHit = March(ray, object[0]);
         if (!objectHit.exist)
             continue;
@@ -354,34 +478,11 @@ uint32_t RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const 
     return color;
 }
 
-// float3 EyeRayDir(float x, float y, float w, float h)
-// {
-//   float fov = 3.141592654f / (2.0f);
-//   float3 rayDir;
-//   rayDir.x = x + 0.5f - (w / 2.0f);
-//   rayDir.y = y + 0.5f - (h / 2.0f);
-//   rayDir.z = -(w) / tan(fov/2.0f);
-//   return normalize(rayDir);
-// }
-
-// float3 EyeRayDir2(float x, float y, float w, float h, float4x4 a_mViewProjInv)
-// {
-//   float4 pos = float4(2.0f*(x+0.5f)/w - 1.0f,
-//                       2.0f*(y+0.5f)/h - 1.0f,
-//                       0.0f,
-//                       1.0f);
-//   pos = a_mViewProjInv * pos;
-//   pos /= pos.w;
-//   return normalize(to_float3(pos));
-// }
-
 
 struct AppData
 {
     int width;
     int height;
-    SdfGrid loaded_grid;
-    int z_level = 32;
     Camera camera;
     std::vector<SceneObject*> scene;
     std::vector<LightingObject*> lighting;
@@ -432,11 +533,6 @@ Ray CastRay(const AppData &app_data, int i, int j)
 void draw_frame(const AppData &app_data, std::vector<uint32_t> &pixels)
 {
     // your rendering code goes here
-    // std::fill_n(pixels.begin(), app_data.width * app_data.height, 0xFFFFFFFF);
-    // int voxel_size = std::min((app_data.width - 1) / app_data.loaded_grid.size.x,
-    //                           (app_data.height - 1) / app_data.loaded_grid.size.y);
-
-    // draw_sdf_grid_slice(app_data.loaded_grid, app_data.z_level, voxel_size, app_data.width, app_data.height, pixels);
     #pragma omp parallel for num_threads(8) schedule(dynamic,1)
     for (int i = 0; i < app_data.width; i++)
     {
@@ -481,13 +577,19 @@ int main(int argc, char **args)
     // const int SCREEN_WIDTH = 400;
     // const int SCREEN_HEIGHT = 400;
 
-    Camera camera(float3(0.0, 0.0, 0.0), float3(1.0, 0.5, 1.0), float3(0.0, 1.0, 0.0));
+    Camera camera(float3(-1.0, 0.0, -1.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
     float speed = 0.01;
     float sensitivity = 0.1;
     updateCamWUV(camera);
     std::vector<SceneObject*> scene;
     // scene.push_back(new Plane(float3(0.0, 0.0, 0.0), 0xBBBBBBFF, Material(), 0.1, 1, 0, 1));
-    scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xFFFFFFFF, Material(), 0.25));
+    // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xFFFFFFFF, Material(), 0.25));
+    // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xBBBBBBFF, Material(), 2));
+
+    SdfGrid grid;
+    load_sdf_grid(grid, "example_grid.grid");
+    scene.push_back(new SdfGridObject(grid, 0xFFFFFFFF, Material()));
+
     std::vector<LightingObject*> lighting;
 
     // Pixel buffer (RGBA format)
@@ -499,7 +601,6 @@ int main(int argc, char **args)
     app_data.camera = camera;
     app_data.scene = scene;
     app_data.lighting = lighting;
-    // load_sdf_grid(app_data.loaded_grid, "example_grid.grid");
 
     // Initialize SDL. SDL_Init will return -1 if it fails.
     if (SDL_Init(SDL_INIT_EVERYTHING) < 0)
@@ -610,6 +711,9 @@ int main(int argc, char **args)
         }
         updateCameraWithMouse(app_data.camera, deltaX, deltaY, 0.001);
         updateCamWUV(app_data.camera);
+        // std::cout << app_data.camera.pos.x << std::endl;
+        // std::cout << app_data.camera.pos.y << std::endl;
+        // std::cout << app_data.camera.pos.z << std::endl;
 
         // Update pixel buffer
         draw_frame(app_data, pixels);
