@@ -31,8 +31,11 @@ using LiteMath::uint2;
 using LiteMath::uint3;
 using LiteMath::uint4;
 
-float EPS_GRAD = 1e-8;
-float EPS_MARCH = 1e-3;
+using std::min;
+using std::max;
+
+float EPS_GRAD = 1e-8f;
+float EPS_MARCH = 1e-3f;
 float MAX_MARCH_ITERATIONS = 75;
 float MAX_MARCH_DIST = 12;
 
@@ -214,14 +217,18 @@ struct SceneObject
     }
     float3 normal(float3 pos)
     {
-        float3 e1(EPS_GRAD, 0.0, 0.0);
-        float3 e2(0.0, EPS_GRAD, 0.0);
-        float3 e3(0.0, 0.0, EPS_GRAD);
-        float dx = (this->distance(pos + e1) - this->distance(pos - e1)) / (2.0 * EPS_GRAD);
-        float dy = this->distance(pos + e2) - this->distance(pos - e2) / (2.0 * EPS_GRAD);
-        float dz = this->distance(pos + e3) - this->distance(pos - e3) / (2.0 * EPS_GRAD);
+        float3 e1(EPS_GRAD, 0.0f, 0.0f);
+        float3 e2(0.0f, EPS_GRAD, 0.0f);
+        float3 e3(0.0f, 0.0f, EPS_GRAD);
+        float dx = (this->distance(pos + e1) - this->distance(pos - e1)) / (2.0f * EPS_GRAD);
+        float dy = this->distance(pos + e2) - this->distance(pos - e2) / (2.0f * EPS_GRAD);
+        float dz = this->distance(pos + e3) - this->distance(pos - e3) / (2.0f * EPS_GRAD);
 
         return normalize(float3(dx, dy, dz));
+    }
+    virtual Hit intersect(const Ray &ray)
+    {
+        return Hit();
     }
 };
 
@@ -240,22 +247,73 @@ struct Sphere : SceneObject
     {
         return length(p - this->pos) - this->radius;
     }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float3 k = ray.pos - this->pos;
+        float b = dot(k, ray.dir);
+        float c = dot(k, k) - this->radius * this->radius;
+        float d = b * b - c;
+      
+        if(d >= 0)
+        {
+            float sqrtfd = sqrtf(d);
+            float t1 = -b + sqrtfd;
+            float t2 = -b - sqrtfd;
+            float min_t  = min(t1,t2);
+            float max_t = max(t1,t2);
+            float t = (min_t >= 0) ? min_t : max_t;
+            if (t > 0) {
+                return Hit(t, this->color, this->material);
+            }
+        
+        }
+        return Hit();
+    }
 };
 
 struct Box : SceneObject
 {
-    float dist;
-    Box(float3 pos, uint32_t color, Material material, float dist)
+    float3 boxMin, boxMax;
+    Box() {}
+    Box(float3 boxMin, float3 boxMax, uint32_t color, Material material)
     {
-        this->pos = pos;
+        this->pos = (boxMin + boxMax) / 2;
+        this->boxMin = boxMin;
+        this->boxMax = boxMax;
         this->color = color;
         this->material = material;
-        this->dist = dist;
     }
 
     float distance(float3 p) override
     {
-        return hmax(p - this->pos) - this->dist;
+        float3 q = abs(p) - this->pos;
+        return length(clamp(q, 0.0f, 99999.0f)) + min(max(q.x, max(q.y, q.z)), 0.0f);
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float tmin, tmax;
+        float3 inv_dir = 1.0f / ray.dir; 
+        float lo = inv_dir.x * (boxMin.x - ray.pos.x);
+        float hi = inv_dir.x * (boxMax.x - ray.pos.x);
+        tmin = min(lo, hi);
+        tmax = max(lo, hi);
+
+        float lo1 = inv_dir.y * (boxMin.y - ray.pos.y);
+        float hi1 = inv_dir.y * (boxMax.y - ray.pos.y);
+        tmin  = max(tmin, min(lo1, hi1));
+        tmax = min(tmax, max(lo1, hi1));
+
+        float lo2 = inv_dir.z*(boxMin.z - ray.pos.z);
+        float hi2 = inv_dir.z*(boxMax.z - ray.pos.z);
+        tmin  = max(tmin, min(lo2, hi2));
+        tmax = min(tmax, max(lo2, hi2));
+
+        if ((tmin <= tmax) && (tmax > 0.f)) {
+            return Hit(tmin, this->color, this->material);
+        }
+        return Hit();
     }
 };
 
@@ -284,9 +342,18 @@ struct Plane : SceneObject
     {
         return this->nVec;
     }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float t = -(dot(ray.pos, this->nVec) + this->d) / dot(ray.dir, this->nVec);
+        if (t >= 0) {
+            return Hit(t, this->color, this->material);
+        }
+        return Hit();
+    }
 };
 
-bool checkBounds(float3 point)
+bool checkBounds(const float3 &point)
 {
     if (point.x < -1 || point.x > 1) {
         return false;
@@ -300,7 +367,7 @@ bool checkBounds(float3 point)
     return true;
 }
 
-bool checkGridBounds(float3 point, const SdfGrid &grid)
+bool checkGridBounds(const float3 &point, const SdfGrid &grid)
 {
     if (point.x < 0 || point.x > grid.size.x - 1) {
         return false;
@@ -323,17 +390,13 @@ float gridIndex(const SdfGrid &grid, int x, int y, int z)
     return grid.data[x + y * grid.size.x + z * grid.size.x * grid.size.y];
 }
 
-float trilinearInterpolation(float3 point, const SdfGrid &grid)
+float trilinearInterpolation(const float3 &point, const SdfGrid &grid)
 {
-    if (!checkBounds(point))
-    {
-        return hmax(abs(point)) - 1;
-    }
     // std::cout << "trilinearInterpolation" << std::endl;
-    float3 point_scaled = (point + 1) * float3(grid.size.x, grid.size.y, grid.size.z) / 2;
+    float3 point_scaled = (point + 1.0f) * float3(grid.size.x, grid.size.y, grid.size.z) / 2.0f;
     if (!checkGridBounds(point_scaled, grid))
     {
-        return 999;
+        return 999.0f;
     }
     int3 lb = (int3) floor(point_scaled);
     int3 ub = (int3) ceil(point_scaled);
@@ -362,19 +425,58 @@ float trilinearInterpolation(float3 point, const SdfGrid &grid)
     return c0 * (1 - z) + c1 * z;
 }
 
+Hit March(const Ray &ray, SceneObject& object)
+{
+    float3 start(ray.pos);
+    float length = 0.0f;
+    for (int i = 0; i < MAX_MARCH_ITERATIONS; i++)
+    {
+        float3 point = start + length * ray.dir;
+        float distance = object.distance(point);
+        if (distance < EPS_MARCH) {
+            return Hit(length, object.color, object.material);
+        }
+        length += distance;
+        if (length > MAX_MARCH_DIST) break;
+    }
+    return Hit();
+}
+
 struct SdfGridObject : SceneObject
 {
     SdfGrid grid;
+    Box boundingBox;
     SdfGridObject(SdfGrid grid, uint32_t color, Material material)
     {
         this->grid = grid;
         this->color = color;
         this->material = material;
+        this->boundingBox = Box(float3(-1.0f, -1.0f, -1.0f), float3(1.0f, 1.0f, 1.0f), 0xFFFFFFFF, Material());
     }
 
     float distance(float3 p) override
     {
         return trilinearInterpolation(p, this->grid);
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        if (checkBounds(ray.pos))
+        {
+            return March(ray, *this);
+        }
+        Hit bboxHit = this->boundingBox.intersect(ray);
+        if (bboxHit.exist)
+        {
+            Ray newRay(ray);
+            newRay.pos += newRay.dir * (bboxHit.t + 1e-4);
+            if (!checkBounds(newRay.pos))
+            {
+                return Hit();
+            }
+            return March(newRay, *this);
+        }
+        return Hit();
     }
 };
 
@@ -397,47 +499,14 @@ struct DirectionalLight : LightingObject
     }
 };
 
-
-Hit March(const Ray &ray, SceneObject& object)
-{
-    // std::cout << "March" << std::endl;
-    float3 start(ray.pos);
-    bool firstHit = true;
-    if (hmax(abs(start)) < 1)
-    {
-        firstHit = false;
-    }
-    float length = 0.0;
-    for (int i = 0; i < MAX_MARCH_ITERATIONS; i++)
-    {
-        float3 point = start + length * ray.dir;
-        float distance = object.distance(point);
-        if (distance < EPS_MARCH) {
-            if (firstHit) {
-                start += 1.2 * length * ray.dir;
-                length = 0;
-                firstHit = false;
-                // length += 1e-3;
-                continue;
-            }
-            else if (hmax(abs(point)) > 1) break;
-            return Hit(length, object.color, object.material);
-        }
-        length += distance;
-        if (length > MAX_MARCH_DIST) break;
-    }
-    return Hit();
-}
-
 Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
 {
-    float min_t = 999999999.0;
+    float min_t = 999999999.0f;
     Hit bestHit;
     bestHit.exist = false;
     for (SceneObject* object : scene)
     {
-        // TODO: move marching into object interface
-        Hit objectHit = March(ray, object[0]);
+        Hit objectHit = object[0].intersect(ray);
         if (!objectHit.exist)
             continue;
         if (objectHit.t < min_t) {
@@ -578,12 +647,13 @@ int main(int argc, char **args)
     // const int SCREEN_HEIGHT = 400;
 
     Camera camera(float3(-1.0, 0.0, -1.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
-    float speed = 0.01;
-    float sensitivity = 0.1;
+    float speed = 0.01f;
+    float sensitivity = 0.1f;
     updateCamWUV(camera);
     std::vector<SceneObject*> scene;
-    // scene.push_back(new Plane(float3(0.0, 0.0, 0.0), 0xBBBBBBFF, Material(), 0.1, 1, 0, 1));
+    scene.push_back(new Plane(float3(0.0, 0.0, 0.0), 0xBBBBBBFF, Material(), 0.1, 1, 0, 1));
     // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xFFFFFFFF, Material(), 0.25));
+    // scene.push_back(new Box(float3(-0.5, -0.5, -0.5), float3(0.5, 0.5, 0.5), 0xFFFFFFFF, Material()));
     // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xBBBBBBFF, Material(), 2));
 
     SdfGrid grid;
