@@ -286,6 +286,81 @@ struct Sphere : SceneObject
     }
 };
 
+float dot2(const float3 &x)
+{
+    return dot(x, x);
+}
+
+float clamp(const float &x, const float &a, const float &b)
+{
+    return min(max(x, a), b);
+}
+
+
+template <typename T> int sign(T val) {
+    return (T(0) < val) - (val < T(0));
+}
+
+struct Triangle : SceneObject
+{
+    float3 a, b, c;
+    float3 an, bn, cn;
+    Triangle(float3 a, float3 b, float3 c, float4 color, Material material)
+    {
+        this->color = color;
+        this->material = material;
+        this->a = a;
+        this->b = b;
+        this->c = c;
+    }
+    Triangle(float3 a, float3 b, float3 c, float3 an, float3 bn, float3 cn, float4 color, Material material)
+    {
+        this->color = color;
+        this->material = material;
+        this->a = a;
+        this->b = b;
+        this->c = c;
+        this->an = an;
+        this->bn = bn;
+        this->cn = cn;
+    }
+
+    float distance(float3 p) override
+    {
+        float3 ba = b - a; float3 pa = p - a;
+        float3 cb = c - b; float3 pb = p - b;
+        float3 ac = a - c; float3 pc = p - c;
+        float3 nor = cross(ba, ac);
+      
+        return sqrt(
+          (sign(dot(cross(ba, nor), pa)) +
+           sign(dot(cross(cb, nor), pb)) +
+           sign(dot(cross(ac, nor), pc)) < 2.0)
+           ?
+           min( min(
+           dot2(ba * clamp(dot(ba, pa) / dot2(ba), 0.0, 1.0) - pa),
+           dot2(cb * clamp(dot(cb, pb) / dot2(cb), 0.0, 1.0) - pb)),
+           dot2(ac * clamp(dot(ac, pc) / dot2(ac), 0.0, 1.0) - pc))
+           :
+           dot(nor, pa)*dot(nor, pa) / dot2(nor));
+      }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float3 v1v0 = b - a;
+        float3 v2v0 = c - a;
+        float3 rov0 = ray.pos - a;
+        float3  n = cross(v1v0, v2v0);
+        float3  q = cross(rov0, ray.dir);
+        float d = 1.0/dot(ray.dir, n);
+        float u = d*dot(-q, v2v0);
+        float v = d*dot(q, v1v0);
+        float t = d*dot(-n, rov0);
+        if( u<0.0 || v<0.0 || (u+v)>1.0 ) return Hit(); //t = -1.0;
+        return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
+    }
+};
+
 struct Box : SceneObject
 {
     float3 boxMin, boxMax;
@@ -403,7 +478,7 @@ float gridIndex(const SdfGrid &grid, int x, int y, int z)
 
 float trilinearInterpolation(const float3 &point, const SdfGrid &grid)
 {
-    float3 point_scaled = (point + 1.0f) * float3(grid.size.x, grid.size.y, grid.size.z) / 2.0f;
+    float3 point_scaled = (point + 1.0f) * float3(grid.size.x - 1, grid.size.y - 1, grid.size.z - 1) / 2.0f;
     if (!checkGridBounds(point_scaled, grid))
     {
         return 0.01f;
@@ -527,9 +602,6 @@ Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene)
 
 float Shade(const float3 &nVec, const float3 &lightDir)
 {
-    // std::cout << nVec.x << " " << nVec.y << " " << nVec.z << std::endl;
-    // std::cout << max(0.1f, dot(nVec, lightDir)) << std::endl;
-    // std::cout << std::endl;
     return max(0.1f, dot(nVec, lightDir));
 }
 
@@ -570,7 +642,6 @@ float4 RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const st
     }
 
 
-
     // if (hit.material.refraction > 0)
     // {
     //   Ray reflRay = refract(ray, hit);
@@ -580,7 +651,6 @@ float4 RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const st
     return color;
 }
 
-
 struct AppData
 {
     int width;
@@ -589,7 +659,6 @@ struct AppData
     std::vector<SceneObject*> scene;
     std::vector<LightingObject*> lighting;
 };
-
 
 Ray CastRay(const AppData &app_data, int i, int j)
 {
@@ -649,20 +718,83 @@ void save_frame(const char *filename, const std::vector<uint32_t> &frame, uint32
     //    stbi_write_png(filename, width, height, 4, (unsigned char*)frame.data(), width * 4)
 }
 
+
+void coutFloat4(const float4 &f)
+{
+    std::cout << f.x << ", " << f.y << ", " << f.z << ", " << f.w << std::endl;
+}
+
+float3 fromFloat4(const float4 &f)
+{
+    return float3(f.x, f.y, f.z);
+}
+
+std::vector<Triangle> ConvertToTriangles(const SimpleMesh &mesh) {
+    std::vector<Triangle> triangles;
+    const size_t triCount = mesh.TrianglesNum();
+    
+    for(size_t i = 0; i < triCount; ++i) {
+        
+        const uint32_t idx0 = mesh.indices[3*i + 0];
+        const uint32_t idx1 = mesh.indices[3*i + 1];
+        const uint32_t idx2 = mesh.indices[3*i + 2];
+        
+        float3 a = fromFloat4(mesh.vPos4f[idx0]);
+        float3 an = fromFloat4(mesh.vNorm4f[idx0]);
+        
+        float3 b = fromFloat4(mesh.vPos4f[idx1]);
+        float3 bn = fromFloat4(mesh.vNorm4f[idx1]);
+        
+        float3 c = fromFloat4(mesh.vPos4f[idx2]);
+        float3 cn = fromFloat4(mesh.vNorm4f[idx2]);
+        
+        triangles.push_back(Triangle(a, b, c, an, bn, cn, float4(255.0, 255.0, 255.0, 255.0), Material()));
+    }
+    
+    return triangles;
+}
+
+
+// SdfGrid sdfGridFromMesh(SimpleMesh &mesh, uint3 grid_size)
+// {
+// }
+
 // You must include the command line parameters for your main function to be recognized by SDL
 int main(int argc, char **args)
 {
+    // std::vector<Triangle> mesh_primitives;
+    // SimpleMesh mesh;
+    // if (argc > 1)
+    // {
+    //     std::cout << args[1] << std::endl;     
+    //     if (strcmp(args[1], "conversion") == 0) {
+    //         const char* input = args[2];
+    //         const char* output = args[3];
+    //         const char* mode = args[4];
+    //         int param = std::stoi(args[5]);
+
+    //         mesh = LoadMeshFromObj(input, true);
+    //         // std::cout << mesh.indices.size() << std::endl;
+    //         // mesh_primitives = ConvertToTriangles(mesh);
+    //     }
+    // }
+    // exit(0);
     // const int SCREEN_WIDTH = 960;
     // const int SCREEN_HEIGHT = 960;
-    const int SCREEN_WIDTH = 400;
-    const int SCREEN_HEIGHT = 400;
+    const int SCREEN_WIDTH = 500;
+    const int SCREEN_HEIGHT = 500;
 
     Camera camera(float3(-2.0, 0.0, -2.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
     float speed = 0.025f;
     float sensitivity = 0.1f;
     updateCamWUV(camera);
     std::vector<SceneObject*> scene;
-    scene.push_back(new Plane(float3(0.0, 0.0, 0.0), float4(187.f,187.f,187.f,187.f), Material(0.75, 0), 0.1, 1, 0, 1));
+    // for (Triangle tr : mesh_primitives)
+    // {
+    //     scene.push_back(new Triangle(tr));
+    // }
+    // scene.push_back(new Plane(float3(0.0, 0.0, 0.0), float4(187.f,187.f,187.f,187.f), Material(0.75, 0), 0.1, 1, 0, 1));
+    // scene.push_back(new Triangle(float3(0.0, 0.0, 0.0), float3(2.0, 0.0, 0.0), float3(0.0, 1.0, 2.0), float4(187.f,187.f,187.f,187.f), Material()));
     // scene.push_back(new Sphere(float3(2.0, 4.0, 1.0), float4(255.f,255.f,255.f,255.f), Material(), 0.25));
     // scene.push_back(new Sphere(float3(0.0, 1.0, 0.0), float4(255.f,25.f,25.f,25.f), Material(1, 0), 0.75));
     // scene.push_back(new Sphere(float3(0.1, 0.05, 0.0), float4(255.f,25.f,95.f,25.f), Material(1, 0), 0.2));
@@ -675,6 +807,7 @@ int main(int argc, char **args)
 
     SdfGrid grid;
     load_sdf_grid(grid, "example_grid.grid");
+    // SdfGrid grid = sdfGridFromMesh(mesh, uint3(10, 10, 10));
     scene.push_back(new SdfGridObject(grid, float4(255.f,255.f,255.f,255.f), Material()));
 
     std::vector<LightingObject*> lighting;
