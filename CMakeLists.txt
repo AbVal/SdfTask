@@ -5,6 +5,8 @@ project(SdfTask CXX)
 
 # Find the SDL2 library
 find_package(SDL2 REQUIRED)
+# Find OpenMP
+find_package(OpenMP REQUIRED)
 
 # Include SDL2 headers
 include_directories(${CMAKE_SOURCE_DIR})
@@ -20,7 +22,7 @@ add_executable(render
     LiteMath/Image2d.cpp)
 
 # Link the SDL2 library to the executable
-target_link_libraries(render ${SDL2_LIBRARIES})
+target_link_libraries(render ${SDL2_LIBRARIES} OpenMP::OpenMP_CXX)
 
 # Set path to executable
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_SOURCE_DIR})
