@@ -16,6 +16,7 @@
 
 #include <omp.h>
 #include <chrono>
+#include <cmath>
 
 #include "mesh.h"
 using namespace cmesh4;
@@ -34,10 +35,11 @@ using LiteMath::uint4;
 using std::min;
 using std::max;
 
-float EPS_GRAD = 1e-8f;
+float EPS_GRAD = 1e-4f;
 float EPS_MARCH = 1e-3f;
 float MAX_MARCH_ITERATIONS = 75;
 float MAX_MARCH_DIST = 12;
+float T_MULT_CONST = 0.999f;
 
 struct SdfGrid
 {
@@ -118,8 +120,6 @@ void updateCamWUV(Camera &camera)
     camera.v = normalize(cross(camera.w, camera.u));
 }
 
-#include <cmath> // For sinf, cosf, asinf
-
 void updateCameraWithMouse(Camera &camera, float deltaX, float deltaY, float sensitivity) {
     // Apply yaw rotation around the camera's up vector (Y-axis)
     if (deltaX != 0.0f) {
@@ -170,20 +170,27 @@ struct Ray
 {
     float3 pos;
     float3 dir;
+    bool reflected;
     Ray() {}
     Ray(float3 pos, float3 dir)
     {
         this->pos = pos;
         this->dir = dir;
     }
+    Ray(float3 pos, float3 dir, bool reflected)
+    {
+        this->pos = pos;
+        this->dir = dir;
+        this->reflected = reflected;
+    }
 };
 
 struct Material
 {
-    int reflection;
-    int refraction;
-    Material() {}
-    Material(int reflection, int refraction)
+    float reflection;
+    float refraction;
+    Material() {reflection = 0; refraction = 0;}
+    Material(float reflection, float refraction)
     {
         this->reflection = reflection;
         this->refraction = refraction;
@@ -194,22 +201,24 @@ struct Hit
 {
     bool exist;
     float t;
-    u_int32_t color;
+    float4 color;
     Material material;
+    float3 nVec;
     Hit() {exist = 0;}
-    Hit(float t,  u_int32_t color, Material material)
+    Hit(float t,  float4 color, Material material, float3 nVec)
     {
         this->exist = true;
         this->t = t;
         this->color = color;
         this->material = material;
+        this->nVec = nVec;
     }
 };
 
 struct SceneObject
 {
     float3 pos;
-    uint32_t color;
+    float4 color;
     Material material;
     virtual float distance(float3 pos)
     {
@@ -224,7 +233,7 @@ struct SceneObject
         float dy = this->distance(pos + e2) - this->distance(pos - e2) / (2.0f * EPS_GRAD);
         float dz = this->distance(pos + e3) - this->distance(pos - e3) / (2.0f * EPS_GRAD);
 
-        return normalize(float3(dx, dy, dz));
+        return normalize(-float3(dx, dy, dz));
     }
     virtual Hit intersect(const Ray &ray)
     {
@@ -235,7 +244,7 @@ struct SceneObject
 struct Sphere : SceneObject
 {
     float radius;
-    Sphere(float3 pos, uint32_t color, Material material, float radius)
+    Sphere(float3 pos, float4 color, Material material, float radius)
     {
         this->pos = pos;
         this->color = color;
@@ -246,6 +255,11 @@ struct Sphere : SceneObject
     float distance(float3 p) override
     {
         return length(p - this->pos) - this->radius;
+    }
+
+    float3 normal(float3 pos)
+    {
+        return normalize(pos - this->pos);
     }
 
     Hit intersect(const Ray &ray) override
@@ -264,7 +278,7 @@ struct Sphere : SceneObject
             float max_t = max(t1,t2);
             float t = (min_t >= 0) ? min_t : max_t;
             if (t > 0) {
-                return Hit(t, this->color, this->material);
+                return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
             }
         
         }
@@ -276,7 +290,7 @@ struct Box : SceneObject
 {
     float3 boxMin, boxMax;
     Box() {}
-    Box(float3 boxMin, float3 boxMax, uint32_t color, Material material)
+    Box(float3 boxMin, float3 boxMax, float4 color, Material material)
     {
         this->pos = (boxMin + boxMax) / 2;
         this->boxMin = boxMin;
@@ -302,16 +316,17 @@ struct Box : SceneObject
 
         float lo1 = inv_dir.y * (boxMin.y - ray.pos.y);
         float hi1 = inv_dir.y * (boxMax.y - ray.pos.y);
-        tmin  = max(tmin, min(lo1, hi1));
+        tmin = max(tmin, min(lo1, hi1));
         tmax = min(tmax, max(lo1, hi1));
 
-        float lo2 = inv_dir.z*(boxMin.z - ray.pos.z);
-        float hi2 = inv_dir.z*(boxMax.z - ray.pos.z);
-        tmin  = max(tmin, min(lo2, hi2));
+        float lo2 = inv_dir.z * (boxMin.z - ray.pos.z);
+        float hi2 = inv_dir.z * (boxMax.z - ray.pos.z);
+        tmin = max(tmin, min(lo2, hi2));
         tmax = min(tmax, max(lo2, hi2));
 
+
         if ((tmin <= tmax) && (tmax > 0.f)) {
-            return Hit(tmin, this->color, this->material);
+            return Hit(tmin, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * tmin * ray.dir));
         }
         return Hit();
     }
@@ -321,7 +336,7 @@ struct Plane : SceneObject
 {
     float a, b, c, d;
     float3 nVec;
-    Plane(float3 pos, uint32_t color, Material material, float a, float b, float c, float d)
+    Plane(float3 pos, float4 color, Material material, float a, float b, float c, float d)
     {
         this->pos = pos;
         this->color = color;
@@ -347,7 +362,7 @@ struct Plane : SceneObject
     {
         float t = -(dot(ray.pos, this->nVec) + this->d) / dot(ray.dir, this->nVec);
         if (t >= 0) {
-            return Hit(t, this->color, this->material);
+            return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
         }
         return Hit();
     }
@@ -355,13 +370,13 @@ struct Plane : SceneObject
 
 bool checkBounds(const float3 &point)
 {
-    if (point.x < -1 || point.x > 1) {
+    if (point.x <= -1 || point.x >= 1) {
         return false;
     }
-    if (point.y < -1 || point.y > 1) {
+    if (point.y <= -1 || point.y >= 1) {
         return false;
     }
-    if (point.z < -1 || point.z > 1) {
+    if (point.z <= -1 || point.z >= 1) {
         return false;
     }
     return true;
@@ -383,20 +398,15 @@ bool checkGridBounds(const float3 &point, const SdfGrid &grid)
 
 float gridIndex(const SdfGrid &grid, int x, int y, int z)
 {
-    // std::cout << "gridIndex" << std::endl;
-    // std::cout << x << std::endl;
-    // std::cout << y << std::endl;
-    // std::cout << z << std::endl;
     return grid.data[x + y * grid.size.x + z * grid.size.x * grid.size.y];
 }
 
 float trilinearInterpolation(const float3 &point, const SdfGrid &grid)
 {
-    // std::cout << "trilinearInterpolation" << std::endl;
     float3 point_scaled = (point + 1.0f) * float3(grid.size.x, grid.size.y, grid.size.z) / 2.0f;
     if (!checkGridBounds(point_scaled, grid))
     {
-        return 999.0f;
+        return 0.01f;
     }
     int3 lb = (int3) floor(point_scaled);
     int3 ub = (int3) ceil(point_scaled);
@@ -404,14 +414,6 @@ float trilinearInterpolation(const float3 &point, const SdfGrid &grid)
     ub.y += (ub.y == lb.y);
     ub.z += (ub.z == lb.z);
     float x, y, z;
-    
-    // std::cout << point_scaled.x << std::endl;
-    // std::cout << point_scaled.y << std::endl;
-    // std::cout << point_scaled.z << std::endl;
-    // std::cout << std::endl;
-    // std::cout << std::endl;
-    // std::cout << std::endl;
-
 
     x = (point_scaled.x - lb.x) / (ub.x - lb.x);
     y = (point_scaled.y - lb.y) / (ub.y - lb.y);
@@ -433,10 +435,12 @@ Hit March(const Ray &ray, SceneObject& object)
     {
         float3 point = start + length * ray.dir;
         float distance = object.distance(point);
-        if (distance < EPS_MARCH) {
-            return Hit(length, object.color, object.material);
-        }
         length += distance;
+        if (distance < EPS_MARCH) {
+            
+            return Hit(length, object.color, object.material, object.normal(start + T_MULT_CONST * length * ray.dir));
+        }
+
         if (length > MAX_MARCH_DIST) break;
     }
     return Hit();
@@ -446,12 +450,12 @@ struct SdfGridObject : SceneObject
 {
     SdfGrid grid;
     Box boundingBox;
-    SdfGridObject(SdfGrid grid, uint32_t color, Material material)
+    SdfGridObject(SdfGrid grid, float4 color, Material material)
     {
         this->grid = grid;
         this->color = color;
         this->material = material;
-        this->boundingBox = Box(float3(-1.0f, -1.0f, -1.0f), float3(1.0f, 1.0f, 1.0f), 0xFFFFFFFF, Material());
+        this->boundingBox = Box(float3(-1.0f, -1.0f, -1.0f), float3(1.0f, 1.0f, 1.0f), float4(), Material());
     }
 
     float distance(float3 p) override
@@ -469,12 +473,17 @@ struct SdfGridObject : SceneObject
         if (bboxHit.exist)
         {
             Ray newRay(ray);
-            newRay.pos += newRay.dir * (bboxHit.t + 1e-4);
+            newRay.pos += newRay.dir * (bboxHit.t + EPS_MARCH);
             if (!checkBounds(newRay.pos))
             {
                 return Hit();
             }
-            return March(newRay, *this);
+            Hit innerHit = March(newRay, *this);
+            if (innerHit.exist)
+            {
+                innerHit.t += bboxHit.t + EPS_MARCH;
+                return innerHit;
+            }
         }
         return Hit();
     }
@@ -483,7 +492,7 @@ struct SdfGridObject : SceneObject
 struct LightingObject
 {
     float3 pos;
-    float3 lightVec(float3 pos);
+    virtual float3 lightVec(float3 pos) {return float3(0, 1, 0);}
 };
 
 struct DirectionalLight : LightingObject
@@ -491,19 +500,18 @@ struct DirectionalLight : LightingObject
     float3 direction;
     DirectionalLight(float3 pos, float3 direction)
     {
-        this->direction = direction;
+        this->direction = normalize(direction);
     }
-    float3 lightVec(float3 pos)
+    float3 lightVec(float3 pos) override
     {
         return this->direction;
     }
 };
 
-Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
+Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene)
 {
     float min_t = 999999999.0f;
     Hit bestHit;
-    bestHit.exist = false;
     for (SceneObject* object : scene)
     {
         Hit objectHit = object[0].intersect(ray);
@@ -517,26 +525,51 @@ Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene,
     return bestHit;
 }
 
-uint32_t RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
+float Shade(const float3 &nVec, const float3 &lightDir)
 {
-    uint32_t color = 0;
+    // std::cout << nVec.x << " " << nVec.y << " " << nVec.z << std::endl;
+    // std::cout << max(0.1f, dot(nVec, lightDir)) << std::endl;
+    // std::cout << std::endl;
+    return max(0.1f, dot(nVec, lightDir));
+}
 
-    Hit hit = RaySceneIntersection(ray, scene, lights);
+float3 Reflect(const float3& dir, const float3& nVec)
+
+{
+    float3 temp = nVec * dot(dir, nVec) * (-2);
+    float3 rVec = normalize(temp + dir);
+    return rVec;
+}
+
+float4 RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
+{
+    float4 color(0.0f, 0.0f, 0.0f, 0.0f);
+
+    Hit hit = RaySceneIntersection(ray, scene);
     if (!hit.exist)
         return color;
 
-    float3 hit_point = ray.pos + hit.t * ray.dir;
+    float3 hit_point = ray.pos + T_MULT_CONST * hit.t * ray.dir;
+    // std::cout << hit_point.x << " " << hit_point.y << " " << hit_point.z << std::endl;
+
     color = hit.color;
+    for (LightingObject* light : lights)
+    {
+        float3 lightDir = -light[0].lightVec(hit_point);
+        Ray lightRay(hit_point, lightDir);
+        Hit lightHit = RaySceneIntersection(lightRay, scene);
+        if (lightHit.exist)
+            color *= Shade(hit.nVec, lightDir);
+        color *= Shade(hit.nVec, lightDir);
+    }
 
-    // for (int i = 0; i < NumLights; i++)
-    //   if (Visible(hit_point, lights[i]))
-    //     color += Shade(hit, lights[i]);
+    if (!ray.reflected && hit.material.reflection > 0)
+    {
+        Ray reflRay(hit_point, Reflect(ray.dir, hit.nVec), true);
+        color += hit.material.reflection * RayTrace(reflRay, scene, lights);
+    }
 
-    // if (hit.material.reflection > 0)
-    // {
-    //   Ray reflRay = reflect(ray, hit);
-    //   color += hit.material.reflection * RayTrace(reflRay);
-    // }
+
 
     // if (hit.material.refraction > 0)
     // {
@@ -557,34 +590,6 @@ struct AppData
     std::vector<LightingObject*> lighting;
 };
 
-void draw_sdf_grid_slice(const SdfGrid &grid, int z_level, int voxel_size,
-                         int width, int height, std::vector<uint32_t> &pixels)
-{
-    constexpr uint32_t COLOR_EMPTY = 0xFF333333;  // dark gray
-    constexpr uint32_t COLOR_FULL = 0xFFFFA500;   // orange
-    constexpr uint32_t COLOR_BORDER = 0xFF000000; // black
-
-    for (int y = 0; y < grid.size.y; y++)
-    {
-        for (int x = 0; x < grid.size.x; x++)
-        {
-            int index = x + y * grid.size.x + z_level * grid.size.x * grid.size.y;
-            uint32_t color = grid.data[index] < 0 ? COLOR_FULL : COLOR_EMPTY;
-            for (int i = 0; i <= voxel_size; i++)
-            {
-                for (int j = 0; j <= voxel_size; j++)
-                {
-                    // flip the y axis
-                    int pixel_idx = (x * voxel_size + i) + ((height - 1) - (y * voxel_size + j)) * width;
-                    if (i == 0 || i == voxel_size || j == 0 || j == voxel_size)
-                        pixels[pixel_idx] = COLOR_BORDER;
-                    else
-                        pixels[pixel_idx] = color;
-                }
-            }
-        }
-    }
-}
 
 Ray CastRay(const AppData &app_data, int i, int j)
 {
@@ -599,6 +604,12 @@ Ray CastRay(const AppData &app_data, int i, int j)
 
 }
 
+uint32_t colorRGBA(const float4 &color)
+{
+    int4 colorInt = (int4) clamp(color, 0, 255);
+    return (((uint32_t) colorInt.x) << 24) + (((uint32_t) colorInt.y) << 16) + (((uint32_t) colorInt.z) << 8) + ((uint32_t) colorInt.w);
+}
+
 void draw_frame(const AppData &app_data, std::vector<uint32_t> &pixels)
 {
     // your rendering code goes here
@@ -608,9 +619,9 @@ void draw_frame(const AppData &app_data, std::vector<uint32_t> &pixels)
         for (int j = 0; j < app_data.height; j++)
         {
             Ray ray = CastRay(app_data, i, j);
-            uint32_t color = RayTrace(ray, app_data.scene, app_data.lighting);
+            float4 color = RayTrace(ray, app_data.scene, app_data.lighting);
             int pixel_idx = i + ((app_data.height - 1) - j) * app_data.width;
-            pixels[pixel_idx] = color;
+            pixels[pixel_idx] = colorRGBA(color);
         }
     }
 }
@@ -641,26 +652,34 @@ void save_frame(const char *filename, const std::vector<uint32_t> &frame, uint32
 // You must include the command line parameters for your main function to be recognized by SDL
 int main(int argc, char **args)
 {
-    const int SCREEN_WIDTH = 960;
-    const int SCREEN_HEIGHT = 960;
-    // const int SCREEN_WIDTH = 400;
-    // const int SCREEN_HEIGHT = 400;
+    // const int SCREEN_WIDTH = 960;
+    // const int SCREEN_HEIGHT = 960;
+    const int SCREEN_WIDTH = 400;
+    const int SCREEN_HEIGHT = 400;
 
-    Camera camera(float3(-1.0, 0.0, -1.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
-    float speed = 0.01f;
+    Camera camera(float3(-2.0, 0.0, -2.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
+    float speed = 0.025f;
     float sensitivity = 0.1f;
     updateCamWUV(camera);
     std::vector<SceneObject*> scene;
-    scene.push_back(new Plane(float3(0.0, 0.0, 0.0), 0xBBBBBBFF, Material(), 0.1, 1, 0, 1));
-    // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xFFFFFFFF, Material(), 0.25));
-    // scene.push_back(new Box(float3(-0.5, -0.5, -0.5), float3(0.5, 0.5, 0.5), 0xFFFFFFFF, Material()));
-    // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xBBBBBBFF, Material(), 2));
+    scene.push_back(new Plane(float3(0.0, 0.0, 0.0), float4(187.f,187.f,187.f,187.f), Material(0.75, 0), 0.1, 1, 0, 1));
+    // scene.push_back(new Sphere(float3(2.0, 4.0, 1.0), float4(255.f,255.f,255.f,255.f), Material(), 0.25));
+    // scene.push_back(new Sphere(float3(0.0, 1.0, 0.0), float4(255.f,25.f,25.f,25.f), Material(1, 0), 0.75));
+    // scene.push_back(new Sphere(float3(0.1, 0.05, 0.0), float4(255.f,25.f,95.f,25.f), Material(1, 0), 0.2));
+    // scene.push_back(new Sphere(float3(0.0, 0.0, 0.0), float4(187.f,187.f,187.f,255.f), Material(), 1.2));
+    // scene.push_back(new Box(float3(-1.2, -1.2, -1.2), float3(-0.3, 0.02, -0.3), float4(255.f,255.f,255.f,255.f), Material()));
+    // scene.push_back(new Box(float3(-0.5, -0.5, -0.5), float3(0.5, 0.5, 0.5), float4(255.f,255.f,255.f,255.f), Material()));
+    // scene.push_back(new Box(float3(-1, -1, -1), float3(1, 1, 1), float4(255.f,255.f,255.f,255.f), Material()));
+    // scene.push_back(new Box(float3(-0.8f, -0.8f, -0.8f), float3(0.8f, 0.8f, 0.8f), float4(255.f,0.f,0.f,255.f), Material()));
+    // scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), float4(187.f,187.f,187.f,255.f), Material(), 2));
 
     SdfGrid grid;
     load_sdf_grid(grid, "example_grid.grid");
-    scene.push_back(new SdfGridObject(grid, 0xFFFFFFFF, Material()));
+    scene.push_back(new SdfGridObject(grid, float4(255.f,255.f,255.f,255.f), Material()));
 
     std::vector<LightingObject*> lighting;
+    // lighting.push_back(new DirectionalLight(float3(10.0, 10.0, 10.0), float3(0, -1.0, 0)));
+    lighting.push_back(new DirectionalLight(float3(10.0, 10.0, 10.0), float3(1, -1.0, 0)));
 
     // Pixel buffer (RGBA format)
     std::vector<uint32_t> pixels(SCREEN_WIDTH * SCREEN_HEIGHT, 0xFFFFFFFF); // Initialize with white pixels
@@ -781,7 +800,8 @@ int main(int argc, char **args)
         }
         updateCameraWithMouse(app_data.camera, deltaX, deltaY, 0.001);
         updateCamWUV(app_data.camera);
-        // std::cout << app_data.camera.pos.x << std::endl;
+        // std::cout << app_data.camera.pos.x << " " << app_data.camera.pos.y << " " << app_data.camera.pos.z << " " << std::endl;
+        // std::cout << app_data.camera.camDir.x << " " << app_data.camera.camDir.y << " " << app_data.camera.camDir.z << " " << std::endl;
         // std::cout << app_data.camera.pos.y << std::endl;
         // std::cout << app_data.camera.pos.z << std::endl;
 
