@@ -16,6 +16,7 @@
 
 #include <omp.h>
 #include <chrono>
+#include <cmath>
 
 #include "mesh.h"
 using namespace cmesh4;
@@ -31,10 +32,14 @@ using LiteMath::uint2;
 using LiteMath::uint3;
 using LiteMath::uint4;
 
-float EPS_GRAD = 1e-8;
-float EPS_MARCH = 1e-3;
-float MAX_MARCH_ITERATIONS = 10;
-float MAX_MARCH_DIST = 5;
+using std::max;
+using std::min;
+
+float EPS_GRAD = 1e-4f;
+float EPS_MARCH = 1e-3f;
+float MAX_MARCH_ITERATIONS = 75;
+float MAX_MARCH_DIST = 12;
+float T_MULT_CONST = 0.999f;
 
 struct SdfGrid
 {
@@ -93,7 +98,7 @@ void load_sdf_octree(SdfOctree &scene, const std::string &path)
 
 struct Camera
 {
-    float3 pos; //camera position
+    float3 pos;    // camera position
     float3 camDir; // direction
     float3 camUp;  // up
     Camera() {}
@@ -104,8 +109,8 @@ struct Camera
         this->camUp = camUp;
     }
     float3 w; //-direction
-    float3 u; //camUp x w
-    float3 v; //w x u
+    float3 u; // camUp x w
+    float3 v; // w x u
 };
 
 void updateCamWUV(Camera &camera)
@@ -115,11 +120,11 @@ void updateCamWUV(Camera &camera)
     camera.v = normalize(cross(camera.w, camera.u));
 }
 
-#include <cmath> // For sinf, cosf, asinf
-
-void updateCameraWithMouse(Camera &camera, float deltaX, float deltaY, float sensitivity) {
+void updateCameraWithMouse(Camera &camera, float deltaX, float deltaY, float sensitivity)
+{
     // Apply yaw rotation around the camera's up vector (Y-axis)
-    if (deltaX != 0.0f) {
+    if (deltaX != 0.0f)
+    {
         float yaw = deltaX * sensitivity;
         float cosYaw = cosf(yaw);
         float sinYaw = sinf(yaw);
@@ -135,26 +140,28 @@ void updateCameraWithMouse(Camera &camera, float deltaX, float deltaY, float sen
     }
 
     // Apply pitch rotation around the camera's right vector (u)
-    if (deltaY != 0.0f) {
+    if (deltaY != 0.0f)
+    {
         float pitch = deltaY * sensitivity;
         float cosP = cosf(pitch);
         float sinP = sinf(pitch);
         float3 originalDir = camera.camDir;
 
         // Rotate around the u vector using Rodrigues' rotation formula
-        float3 rotatedDir = originalDir * cosP
-                          + cross(camera.u, originalDir) * sinP
-                          + camera.u * dot(camera.u, originalDir) * (1.0f - cosP);
+        float3 rotatedDir = originalDir * cosP + cross(camera.u, originalDir) * sinP + camera.u * dot(camera.u, originalDir) * (1.0f - cosP);
 
         camera.camDir = normalize(rotatedDir);
 
         // Clamp pitch to prevent flipping
         const float maxPitch = 89.0f * (3.141592654f / 180.0f); // Convert to radians
         float currentPitch = asinf(camera.camDir.y);
-        if (currentPitch > maxPitch) {
+        if (currentPitch > maxPitch)
+        {
             camera.camDir.y = sinf(maxPitch);
             camera.camDir = normalize(camera.camDir);
-        } else if (currentPitch < -maxPitch) {
+        }
+        else if (currentPitch < -maxPitch)
+        {
             camera.camDir.y = sinf(-maxPitch);
             camera.camDir = normalize(camera.camDir);
         }
@@ -167,20 +174,31 @@ struct Ray
 {
     float3 pos;
     float3 dir;
+    bool reflected;
     Ray() {}
     Ray(float3 pos, float3 dir)
     {
         this->pos = pos;
         this->dir = dir;
     }
+    Ray(float3 pos, float3 dir, bool reflected)
+    {
+        this->pos = pos;
+        this->dir = dir;
+        this->reflected = reflected;
+    }
 };
 
 struct Material
 {
-    int reflection;
-    int refraction;
-    Material() {}
-    Material(int reflection, int refraction)
+    float reflection;
+    float refraction;
+    Material()
+    {
+        reflection = 0;
+        refraction = 0;
+    }
+    Material(float reflection, float refraction)
     {
         this->reflection = reflection;
         this->refraction = refraction;
@@ -191,22 +209,24 @@ struct Hit
 {
     bool exist;
     float t;
-    u_int32_t color;
+    float4 color;
     Material material;
-    Hit() {exist = 0;}
-    Hit(float t,  u_int32_t color, Material material)
+    float3 nVec;
+    Hit() { exist = 0; }
+    Hit(float t, float4 color, Material material, float3 nVec)
     {
         this->exist = true;
         this->t = t;
         this->color = color;
         this->material = material;
+        this->nVec = nVec;
     }
 };
 
 struct SceneObject
 {
     float3 pos;
-    uint32_t color;
+    float4 color;
     Material material;
     virtual float distance(float3 pos)
     {
@@ -214,21 +234,25 @@ struct SceneObject
     }
     float3 normal(float3 pos)
     {
-        float3 e1(EPS_GRAD, 0.0, 0.0);
-        float3 e2(0.0, EPS_GRAD, 0.0);
-        float3 e3(0.0, 0.0, EPS_GRAD);
-        float dx = (this->distance(pos + e1) - this->distance(pos - e1)) / (2.0 * EPS_GRAD);
-        float dy = this->distance(pos + e2) - this->distance(pos - e2) / (2.0 * EPS_GRAD);
-        float dz = this->distance(pos + e3) - this->distance(pos - e3) / (2.0 * EPS_GRAD);
+        float3 e1(EPS_GRAD, 0.0f, 0.0f);
+        float3 e2(0.0f, EPS_GRAD, 0.0f);
+        float3 e3(0.0f, 0.0f, EPS_GRAD);
+        float dx = (this->distance(pos + e1) - this->distance(pos - e1)) / (2.0f * EPS_GRAD);
+        float dy = this->distance(pos + e2) - this->distance(pos - e2) / (2.0f * EPS_GRAD);
+        float dz = this->distance(pos + e3) - this->distance(pos - e3) / (2.0f * EPS_GRAD);
 
-        return normalize(float3(dx, dy, dz));
+        return normalize(-float3(dx, dy, dz));
+    }
+    virtual Hit intersect(const Ray &ray)
+    {
+        return Hit();
     }
 };
 
 struct Sphere : SceneObject
 {
     float radius;
-    Sphere(float3 pos, uint32_t color, Material material, float radius)
+    Sphere(float3 pos, float4 color, Material material, float radius)
     {
         this->pos = pos;
         this->color = color;
@@ -240,13 +264,166 @@ struct Sphere : SceneObject
     {
         return length(p - this->pos) - this->radius;
     }
+
+    float3 normal(float3 pos)
+    {
+        return normalize(pos - this->pos);
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float3 k = ray.pos - this->pos;
+        float b = dot(k, ray.dir);
+        float c = dot(k, k) - this->radius * this->radius;
+        float d = b * b - c;
+
+        if (d >= 0)
+        {
+            float sqrtfd = sqrtf(d);
+            float t1 = -b + sqrtfd;
+            float t2 = -b - sqrtfd;
+            float min_t = min(t1, t2);
+            float max_t = max(t1, t2);
+            float t = (min_t >= 0) ? min_t : max_t;
+            if (t > 0)
+            {
+                return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
+            }
+        }
+        return Hit();
+    }
+};
+
+float dot2(const float3 &x)
+{
+    return dot(x, x);
+}
+
+float clamp(const float &x, const float &a, const float &b)
+{
+    return min(max(x, a), b);
+}
+
+template <typename T>
+int sign(T val)
+{
+    return (T(0) < val) - (val < T(0));
+}
+
+struct SingleTriangle : SceneObject
+{
+    float3 a, b, c;
+    float3 an, bn, cn;
+    SingleTriangle(float3 a, float3 b, float3 c, float4 color, Material material)
+    {
+        this->color = color;
+        this->material = material;
+        this->a = a;
+        this->b = b;
+        this->c = c;
+    }
+    SingleTriangle(float3 a, float3 b, float3 c, float3 an, float3 bn, float3 cn, float4 color, Material material)
+    {
+        this->color = color;
+        this->material = material;
+        this->a = a;
+        this->b = b;
+        this->c = c;
+        this->an = an;
+        this->bn = bn;
+        this->cn = cn;
+    }
+
+    float distance(float3 p) override
+    {
+        float3 ba = b - a;
+        float3 pa = p - a;
+        float3 cb = c - b;
+        float3 pb = p - b;
+        float3 ac = a - c;
+        float3 pc = p - c;
+        float3 nor = cross(ba, ac);
+
+        return sqrt(
+            (sign(dot(cross(ba, nor), pa)) +
+                 sign(dot(cross(cb, nor), pb)) +
+                 sign(dot(cross(ac, nor), pc)) <
+             2.0)
+                ? min(min(
+                          dot2(ba * clamp(dot(ba, pa) / dot2(ba), 0.0, 1.0) - pa),
+                          dot2(cb * clamp(dot(cb, pb) / dot2(cb), 0.0, 1.0) - pb)),
+                      dot2(ac * clamp(dot(ac, pc) / dot2(ac), 0.0, 1.0) - pc))
+                : dot(nor, pa) * dot(nor, pa) / dot2(nor));
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float3 v1v0 = b - a;
+        float3 v2v0 = c - a;
+        float3 rov0 = ray.pos - a;
+        float3 n = cross(v1v0, v2v0);
+        float3 q = cross(rov0, ray.dir);
+        float d = 1.0 / dot(ray.dir, n);
+        float u = d * dot(-q, v2v0);
+        float v = d * dot(q, v1v0);
+        float t = d * dot(-n, rov0);
+        if (u < 0.0 || v < 0.0 || (u + v) > 1.0)
+            return Hit(); // t = -1.0;
+        return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
+    }
+};
+
+struct Box : SceneObject
+{
+    float3 boxMin, boxMax;
+    Box() {}
+    Box(float3 boxMin, float3 boxMax, float4 color, Material material)
+    {
+        this->pos = (boxMin + boxMax) / 2;
+        this->boxMin = boxMin;
+        this->boxMax = boxMax;
+        this->color = color;
+        this->material = material;
+    }
+
+    float distance(float3 p) override
+    {
+        float3 q = abs(p) - this->pos;
+        return length(clamp(q, 0.0f, 99999.0f)) + min(max(q.x, max(q.y, q.z)), 0.0f);
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float tmin, tmax;
+        float3 inv_dir = 1.0f / ray.dir;
+        float lo = inv_dir.x * (boxMin.x - ray.pos.x);
+        float hi = inv_dir.x * (boxMax.x - ray.pos.x);
+        tmin = min(lo, hi);
+        tmax = max(lo, hi);
+
+        float lo1 = inv_dir.y * (boxMin.y - ray.pos.y);
+        float hi1 = inv_dir.y * (boxMax.y - ray.pos.y);
+        tmin = max(tmin, min(lo1, hi1));
+        tmax = min(tmax, max(lo1, hi1));
+
+        float lo2 = inv_dir.z * (boxMin.z - ray.pos.z);
+        float hi2 = inv_dir.z * (boxMax.z - ray.pos.z);
+        tmin = max(tmin, min(lo2, hi2));
+        tmax = min(tmax, max(lo2, hi2));
+
+        if ((tmin <= tmax) && (tmax > 0.f))
+        {
+            return Hit(tmin, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * tmin * ray.dir));
+        }
+        return Hit();
+    }
 };
 
 struct Plane : SceneObject
 {
     float a, b, c, d;
     float3 nVec;
-    Plane(float3 pos, uint32_t color, Material material, float a, float b, float c, float d)
+    Plane(float3 pos, float4 color, Material material, float a, float b, float c, float d)
     {
         this->pos = pos;
         this->color = color;
@@ -267,12 +444,151 @@ struct Plane : SceneObject
     {
         return this->nVec;
     }
+
+    Hit intersect(const Ray &ray) override
+    {
+        float t = -(dot(ray.pos, this->nVec) + this->d) / dot(ray.dir, this->nVec);
+        if (t >= 0)
+        {
+            return Hit(t, this->color, this->material, this->normal(ray.pos + T_MULT_CONST * t * ray.dir));
+        }
+        return Hit();
+    }
+};
+
+bool checkBounds(const float3 &point)
+{
+    if (point.x <= -1 || point.x >= 1)
+    {
+        return false;
+    }
+    if (point.y <= -1 || point.y >= 1)
+    {
+        return false;
+    }
+    if (point.z <= -1 || point.z >= 1)
+    {
+        return false;
+    }
+    return true;
+}
+
+bool checkGridBounds(const float3 &point, const SdfGrid &grid)
+{
+    if (point.x < 0 || point.x > grid.size.x - 1)
+    {
+        return false;
+    }
+    if (point.y < 0 || point.y > grid.size.y - 1)
+    {
+        return false;
+    }
+    if (point.z < 0 || point.z > grid.size.z - 1)
+    {
+        return false;
+    }
+    return true;
+}
+
+float gridIndex(const SdfGrid &grid, int x, int y, int z)
+{
+    return grid.data[x + y * grid.size.x + z * grid.size.x * grid.size.y];
+}
+
+float trilinearInterpolation(const float3 &point, const SdfGrid &grid)
+{
+    float3 point_scaled = (point + 1.0f) * float3(grid.size.x - 1, grid.size.y - 1, grid.size.z - 1) / 2.0f;
+    if (!checkGridBounds(point_scaled, grid))
+    {
+        return 0.01f;
+    }
+    int3 lb = (int3)floor(point_scaled);
+    int3 ub = (int3)ceil(point_scaled);
+    ub.x += (ub.x == lb.x);
+    ub.y += (ub.y == lb.y);
+    ub.z += (ub.z == lb.z);
+    float x, y, z;
+
+    x = (point_scaled.x - lb.x) / (ub.x - lb.x);
+    y = (point_scaled.y - lb.y) / (ub.y - lb.y);
+    z = (point_scaled.z - lb.z) / (ub.z - lb.z);
+    float c00 = gridIndex(grid, lb.x, lb.y, lb.z) * (1 - x) + gridIndex(grid, ub.x, lb.y, lb.z) * x;
+    float c01 = gridIndex(grid, lb.x, lb.y, ub.z) * (1 - x) + gridIndex(grid, ub.x, lb.y, ub.z) * x;
+    float c10 = gridIndex(grid, lb.x, ub.y, lb.z) * (1 - x) + gridIndex(grid, ub.x, ub.y, lb.z) * x;
+    float c11 = gridIndex(grid, lb.x, ub.y, ub.z) * (1 - x) + gridIndex(grid, ub.x, ub.y, ub.z) * x;
+    float c0 = c00 * (1 - y) + c10 * y;
+    float c1 = c01 * (1 - y) + c11 * y;
+    return c0 * (1 - z) + c1 * z;
+}
+
+Hit March(const Ray &ray, SceneObject &object)
+{
+    float3 start(ray.pos);
+    float length = 0.0f;
+    for (int i = 0; i < MAX_MARCH_ITERATIONS; i++)
+    {
+        float3 point = start + length * ray.dir;
+        float distance = object.distance(point);
+        length += distance;
+        if (distance < EPS_MARCH)
+        {
+
+            return Hit(length, object.color, object.material, object.normal(start + T_MULT_CONST * length * ray.dir));
+        }
+
+        if (length > MAX_MARCH_DIST)
+            break;
+    }
+    return Hit();
+}
+
+struct SdfGridObject : SceneObject
+{
+    SdfGrid grid;
+    Box boundingBox;
+    SdfGridObject(SdfGrid grid, float4 color, Material material)
+    {
+        this->grid = grid;
+        this->color = color;
+        this->material = material;
+        this->boundingBox = Box(float3(-1.0f, -1.0f, -1.0f), float3(1.0f, 1.0f, 1.0f), float4(), Material());
+    }
+
+    float distance(float3 p) override
+    {
+        return trilinearInterpolation(p, this->grid);
+    }
+
+    Hit intersect(const Ray &ray) override
+    {
+        if (checkBounds(ray.pos))
+        {
+            return March(ray, *this);
+        }
+        Hit bboxHit = this->boundingBox.intersect(ray);
+        if (bboxHit.exist)
+        {
+            Ray newRay(ray);
+            newRay.pos += newRay.dir * (bboxHit.t + EPS_MARCH);
+            if (!checkBounds(newRay.pos))
+            {
+                return Hit();
+            }
+            Hit innerHit = March(newRay, *this);
+            if (innerHit.exist)
+            {
+                innerHit.t += bboxHit.t + EPS_MARCH;
+                return innerHit;
+            }
+        }
+        return Hit();
+    }
 };
 
 struct LightingObject
 {
     float3 pos;
-    float3 lightVec(float3 pos);
+    virtual float3 lightVec(float3 pos) { return float3(0, 1, 0); }
 };
 
 struct DirectionalLight : LightingObject
@@ -280,43 +596,25 @@ struct DirectionalLight : LightingObject
     float3 direction;
     DirectionalLight(float3 pos, float3 direction)
     {
-        this->direction = direction;
+        this->direction = normalize(direction);
     }
-    float3 lightVec(float3 pos)
+    float3 lightVec(float3 pos) override
     {
         return this->direction;
     }
 };
 
-
-Hit March(const Ray &ray, SceneObject& object)
+Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject *> &scene)
 {
-    float3 start(ray.pos);
-    float length = 0.0;
-    for (int i = 0; i < MAX_MARCH_ITERATIONS; i++)
-    {
-        float3 point = start + length * ray.dir;
-        float distance = object.distance(point);
-        if (distance < EPS_MARCH) {
-            return Hit(length, object.color, object.material);
-        }
-        length += distance;
-        if (length > MAX_MARCH_DIST) break;
-    }
-    return Hit();
-}
-
-Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
-{
-    float min_t = 999999999.0;
+    float min_t = 999999999.0f;
     Hit bestHit;
-    bestHit.exist = false;
-    for (SceneObject* object : scene)
+    for (SceneObject *object : scene)
     {
-        Hit objectHit = March(ray, object[0]);
+        Hit objectHit = object[0].intersect(ray);
         if (!objectHit.exist)
             continue;
-        if (objectHit.t < min_t) {
+        if (objectHit.t < min_t)
+        {
             min_t = objectHit.t;
             bestHit = objectHit;
         }
@@ -324,26 +622,46 @@ Hit RaySceneIntersection(const Ray &ray, const std::vector<SceneObject*> &scene,
     return bestHit;
 }
 
-uint32_t RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const std::vector<LightingObject*> &lights)
+float Shade(const float3 &nVec, const float3 &lightDir)
 {
-    uint32_t color = 0;
+    return max(0.1f, dot(nVec, lightDir));
+}
 
-    Hit hit = RaySceneIntersection(ray, scene, lights);
+float3 Reflect(const float3 &dir, const float3 &nVec)
+
+{
+    float3 temp = nVec * dot(dir, nVec) * (-2);
+    float3 rVec = normalize(temp + dir);
+    return rVec;
+}
+
+float4 RayTrace(const Ray &ray, const std::vector<SceneObject *> &scene, const std::vector<LightingObject *> &lights)
+{
+    float4 color(0.0f, 0.0f, 0.0f, 0.0f);
+
+    Hit hit = RaySceneIntersection(ray, scene);
     if (!hit.exist)
         return color;
 
-    float3 hit_point = ray.pos + hit.t * ray.dir;
+    float3 hit_point = ray.pos + T_MULT_CONST * hit.t * ray.dir;
+    // std::cout << hit_point.x << " " << hit_point.y << " " << hit_point.z << std::endl;
+
     color = hit.color;
+    for (LightingObject *light : lights)
+    {
+        float3 lightDir = -light[0].lightVec(hit_point);
+        Ray lightRay(hit_point, lightDir);
+        Hit lightHit = RaySceneIntersection(lightRay, scene);
+        if (lightHit.exist)
+            color *= Shade(hit.nVec, lightDir);
+        color *= Shade(hit.nVec, lightDir);
+    }
 
-    // for (int i = 0; i < NumLights; i++)
-    //   if (Visible(hit_point, lights[i]))
-    //     color += Shade(hit, lights[i]);
-
-    // if (hit.material.reflection > 0)
-    // {
-    //   Ray reflRay = reflect(ray, hit);
-    //   color += hit.material.reflection * RayTrace(reflRay);
-    // }
+    if (!ray.reflected && hit.material.reflection > 0)
+    {
+        Ray reflRay(hit_point, Reflect(ray.dir, hit.nVec), true);
+        color += hit.material.reflection * RayTrace(reflRay, scene, lights);
+    }
 
     // if (hit.material.refraction > 0)
     // {
@@ -354,98 +672,45 @@ uint32_t RayTrace(const Ray &ray, const std::vector<SceneObject*> &scene, const 
     return color;
 }
 
-// float3 EyeRayDir(float x, float y, float w, float h)
-// {
-//   float fov = 3.141592654f / (2.0f);
-//   float3 rayDir;
-//   rayDir.x = x + 0.5f - (w / 2.0f);
-//   rayDir.y = y + 0.5f - (h / 2.0f);
-//   rayDir.z = -(w) / tan(fov/2.0f);
-//   return normalize(rayDir);
-// }
-
-// float3 EyeRayDir2(float x, float y, float w, float h, float4x4 a_mViewProjInv)
-// {
-//   float4 pos = float4(2.0f*(x+0.5f)/w - 1.0f,
-//                       2.0f*(y+0.5f)/h - 1.0f,
-//                       0.0f,
-//                       1.0f);
-//   pos = a_mViewProjInv * pos;
-//   pos /= pos.w;
-//   return normalize(to_float3(pos));
-// }
-
-
 struct AppData
 {
     int width;
     int height;
-    SdfGrid loaded_grid;
-    int z_level = 32;
     Camera camera;
-    std::vector<SceneObject*> scene;
-    std::vector<LightingObject*> lighting;
+    std::vector<SceneObject *> scene;
+    std::vector<LightingObject *> lighting;
 };
-
-void draw_sdf_grid_slice(const SdfGrid &grid, int z_level, int voxel_size,
-                         int width, int height, std::vector<uint32_t> &pixels)
-{
-    constexpr uint32_t COLOR_EMPTY = 0xFF333333;  // dark gray
-    constexpr uint32_t COLOR_FULL = 0xFFFFA500;   // orange
-    constexpr uint32_t COLOR_BORDER = 0xFF000000; // black
-
-    for (int y = 0; y < grid.size.y; y++)
-    {
-        for (int x = 0; x < grid.size.x; x++)
-        {
-            int index = x + y * grid.size.x + z_level * grid.size.x * grid.size.y;
-            uint32_t color = grid.data[index] < 0 ? COLOR_FULL : COLOR_EMPTY;
-            for (int i = 0; i <= voxel_size; i++)
-            {
-                for (int j = 0; j <= voxel_size; j++)
-                {
-                    // flip the y axis
-                    int pixel_idx = (x * voxel_size + i) + ((height - 1) - (y * voxel_size + j)) * width;
-                    if (i == 0 || i == voxel_size || j == 0 || j == voxel_size)
-                        pixels[pixel_idx] = COLOR_BORDER;
-                    else
-                        pixels[pixel_idx] = color;
-                }
-            }
-        }
-    }
-}
 
 Ray CastRay(const AppData &app_data, int i, int j)
 {
     float aspect_ratio = app_data.width / app_data.height;
     float u = (2.0f * (i + 0.5f) / app_data.width - 1.0f) * aspect_ratio; // * scale;
-    float v = (2.0f * (j + 0.5f) / app_data.height - 1.0f); // * scale;
+    float v = (2.0f * (j + 0.5f) / app_data.height - 1.0f);               // * scale;
     Camera camera = app_data.camera;
 
     float3 dir = camera.u * u + camera.v * v + camera.camDir;
 
     return Ray(camera.pos, normalize(dir));
+}
 
+uint32_t colorRGBA(const float4 &color)
+{
+    int4 colorInt = (int4)clamp(color, 0, 255);
+    return (((uint32_t)colorInt.x) << 24) + (((uint32_t)colorInt.y) << 16) + (((uint32_t)colorInt.z) << 8) + ((uint32_t)colorInt.w);
 }
 
 void draw_frame(const AppData &app_data, std::vector<uint32_t> &pixels)
 {
-    // your rendering code goes here
-    // std::fill_n(pixels.begin(), app_data.width * app_data.height, 0xFFFFFFFF);
-    // int voxel_size = std::min((app_data.width - 1) / app_data.loaded_grid.size.x,
-    //                           (app_data.height - 1) / app_data.loaded_grid.size.y);
-
-    // draw_sdf_grid_slice(app_data.loaded_grid, app_data.z_level, voxel_size, app_data.width, app_data.height, pixels);
-    #pragma omp parallel for num_threads(8) schedule(dynamic,1)
+// your rendering code goes here
+#pragma omp parallel for num_threads(8) schedule(dynamic, 1)
     for (int i = 0; i < app_data.width; i++)
     {
         for (int j = 0; j < app_data.height; j++)
         {
             Ray ray = CastRay(app_data, i, j);
-            uint32_t color = RayTrace(ray, app_data.scene, app_data.lighting);
+            float4 color = RayTrace(ray, app_data.scene, app_data.lighting);
             int pixel_idx = i + ((app_data.height - 1) - j) * app_data.width;
-            pixels[pixel_idx] = color;
+            pixels[pixel_idx] = colorRGBA(color);
         }
     }
 }
@@ -473,22 +738,196 @@ void save_frame(const char *filename, const std::vector<uint32_t> &frame, uint32
     //    stbi_write_png(filename, width, height, 4, (unsigned char*)frame.data(), width * 4)
 }
 
-// You must include the command line parameters for your main function to be recognized by SDL
+struct AABB
+{
+    float3 bboxMin;
+    float3 bboxMax;
+    float3 size() const { return bboxMax - bboxMin; }
+    float surfaceArea() const
+    {
+        float3 s = size();
+        return 2.0f * (s.x * s.y + s.x * s.z + s.y * s.z);
+    }
+    AABB combine(const AABB &other) const
+    {
+        return {
+            min(bboxMin, other.bboxMin),
+            max(bboxMax, other.bboxMax)};
+    }
+};
+
+struct Triangle
+{
+    float3 a, b, c;
+    float3 normal;
+    AABB bbox;
+
+    Triangle(const float4 &a4, const float4 &b4, const float4 &c4)
+    {
+        a = to_float3(a4);
+        b = to_float3(b4);
+        c = to_float3(c4);
+        bbox.bboxMin = min(min(a, b), c);
+        bbox.bboxMax = max(max(a, b), c);
+        float3 ab = b - a;
+        float3 ac = c - a;
+        normal = normalize(cross(ab, ac));
+    }
+};
+
+float distanceToAABB(const float3 &p, const AABB &box)
+{
+    float dx = max(max(box.bboxMin.x - p.x, p.x - box.bboxMax.x), 0.0f);
+    float dy = max(max(box.bboxMin.y - p.y, p.y - box.bboxMax.y), 0.0f);
+    float dz = max(max(box.bboxMin.z - p.z, p.z - box.bboxMax.z), 0.0f);
+    return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+float3 closestPointOnTriangle(const float3 &p, const float3 &a, const float3 &b, const float3 &c)
+{
+    // From "Real-Time Collision Detection"
+    // A region check
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f)
+        return a;
+
+    // B region check
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3)
+        return b;
+
+    // AB check
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+    {
+        float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+
+    // C region check
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6)
+        return c;
+
+    // AC check
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+    {
+        float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+
+    // BC check
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+
+    // Inside the triangle
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+float distanceToTriangle(const float3 &p, const Triangle &tri, float3 &closestPt)
+{
+    closestPt = closestPointOnTriangle(p, tri.a, tri.b, tri.c);
+    return length(p - closestPt);
+}
+
+void coutFloat4(const float4 &f)
+{
+    std::cout << f.x << ", " << f.y << ", " << f.z << ", " << f.w << std::endl;
+}
+
 int main(int argc, char **args)
 {
-    const int SCREEN_WIDTH = 960;
-    const int SCREEN_HEIGHT = 960;
-    // const int SCREEN_WIDTH = 400;
-    // const int SCREEN_HEIGHT = 400;
+    std::vector<Triangle> mesh_primitives;
+    SimpleMesh mesh;
+    int param;
+    if (argc <= 1)
+    {
+        std::cerr << "Launch mode not specified, use \"render\"" << std::endl;
+        return 1;
+    }
+    const int SCREEN_WIDTH = 640;
+    const int SCREEN_HEIGHT = 640;
 
-    Camera camera(float3(0.0, 0.0, 0.0), float3(1.0, 0.5, 1.0), float3(0.0, 1.0, 0.0));
-    float speed = 0.01;
-    float sensitivity = 0.1;
+    const float speed = 0.025f;
+    const float sensitivity = 0.1f;
+
+    Camera camera(float3(-2.0, 0.0, -2.0), float3(1.0, 0, 1.0), float3(0.0, 1.0, 0.0));
     updateCamWUV(camera);
-    std::vector<SceneObject*> scene;
-    // scene.push_back(new Plane(float3(0.0, 0.0, 0.0), 0xBBBBBBFF, Material(), 0.1, 1, 0, 1));
-    scene.push_back(new Sphere(float3(0.5, -0.25, 0.5), 0xFFFFFFFF, Material(), 0.25));
-    std::vector<LightingObject*> lighting;
+
+    std::vector<LightingObject *> lighting;
+    lighting.push_back(new DirectionalLight(float3(10.0, 10.0, 10.0), float3(1, -1.0, 0)));
+
+    std::vector<SceneObject *> scene;
+
+    if (strcmp(args[1], "render") != 0)
+    {
+        std::cerr << "Incorrect launch mode, use \"render\"" << std::endl;
+        return 1;
+    }
+    if (strcmp(args[2], "grid") == 0)
+    {
+        const char *input = args[3];
+        SdfGrid grid;
+        load_sdf_grid(grid, input);
+        scene.push_back(new SdfGridObject(grid, float4(255.f, 255.f, 255.f, 255.f), Material()));
+        scene.push_back(new Plane(float3(0.0, 0.0, 0.0), float4(0.f,0.f,0.f,0.f), Material(1, 0), 0, 1, 0, 1.5));
+    }
+    else if (strcmp(args[2], "primitives") == 0)
+    {
+        scene.push_back(new Plane(float3(0.0, 0.0, 0.0), float4(187.f,187.f,187.f,187.f), Material(), 0.1, 1, 0, 1));
+        scene.push_back(new Sphere(float3(0.1, 0.05, 0.0), float4(255.f,25.f,95.f,25.f), Material(0.9, 0), 0.2));
+        scene.push_back(new Sphere(float3(0.0, 1.0, 0.0), float4(255.f,25.f,25.f,25.f), Material(0.5, 0), 0.75));
+        scene.push_back(new Box(float3(2.f, -0.f, -2.f), float3(3.f, 0.8f, -3.f), float4(255.f,0.f,0.f,255.f), Material()));
+        scene.push_back(new Box(float3(-2.f, -0.f, 2.f), float3(-3.f, 0.8f, 2.5f), float4(255.f,255.f,0.f,255.f), Material()));
+    }
+    else if (strcmp(args[2], "mesh_naive") == 0)
+    {
+        const char *input = args[3];
+
+        mesh = LoadMeshFromObj(input, true);
+
+        const size_t triCount = mesh.TrianglesNum();
+
+        for(size_t i = 0; i < triCount; ++i) {
+
+            const uint32_t idx0 = mesh.indices[3*i + 0];
+            const uint32_t idx1 = mesh.indices[3*i + 1];
+            const uint32_t idx2 = mesh.indices[3*i + 2];
+
+            float3 a = to_float3(mesh.vPos4f[idx0]);
+            float3 an = to_float3(mesh.vNorm4f[idx0]);
+
+            float3 b = to_float3(mesh.vPos4f[idx1]);
+            float3 bn = to_float3(mesh.vNorm4f[idx1]);
+
+            float3 c = to_float3(mesh.vPos4f[idx2]);
+            float3 cn = to_float3(mesh.vNorm4f[idx2]);
+
+            scene.push_back(new SingleTriangle(a, b, c, an, bn, cn, float4(255.0, 255.0, 255.0, 255.0), Material()));
+        }
+    }
+    else
+    {
+        std::cerr << "Incorrect render mode, use \"grid\", \"primitives\" or \"mesh_naive\"" << std::endl;
+        return 1;
+    }
 
     // Pixel buffer (RGBA format)
     std::vector<uint32_t> pixels(SCREEN_WIDTH * SCREEN_HEIGHT, 0xFFFFFFFF); // Initialize with white pixels
@@ -499,7 +938,6 @@ int main(int argc, char **args)
     app_data.camera = camera;
     app_data.scene = scene;
     app_data.lighting = lighting;
-    // load_sdf_grid(app_data.loaded_grid, "example_grid.grid");
 
     // Initialize SDL. SDL_Init will return -1 if it fails.
     if (SDL_Init(SDL_INIT_EVERYTHING) < 0)
@@ -563,7 +1001,6 @@ int main(int argc, char **args)
             switch (ev.type)
             {
             case SDL_QUIT:
-                // shut down
                 running = false;
                 break;
             case SDL_MOUSEMOTION:
@@ -571,10 +1008,8 @@ int main(int argc, char **args)
                 deltaY -= ev.motion.yrel;
                 break;
             case SDL_KEYDOWN:
-                // test keycode
                 switch (ev.key.keysym.sym)
                 {
-                // W and S keys to change the slice of the grid currently rendered
                 case SDLK_w:
                     new_pos = app_data.camera.pos + app_data.camera.camDir * speed;
                     app_data.camera.pos = new_pos;

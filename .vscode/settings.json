@@ -69,6 +69,11 @@
     "thread": "cpp",
     "__nullptr": "cpp",
     "ios": "cpp",
-    "__bit_reference": "cpp"
+    "__bit_reference": "cpp",
+    "queue": "cpp",
+    "stack": "cpp",
+    "__locale": "cpp",
+    "__node_handle": "cpp",
+    "__split_buffer": "cpp"
   }
 }

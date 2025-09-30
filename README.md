@@ -1,13 +1,7 @@
-# SdfTaskTemplate
-Template for task 1 (Signed Distance Fields). Part of Forward and Inverse Rendering (FAIR) course, CMC MSU, Spring 2025.
+# SdfTask
+Task 1 (Signed Distance Fields). Part of Forward and Inverse Rendering (FAIR) course, CMC MSU, Spring 2025.
 
 ## Build
-Clone this repo with its submodules:
-
-    git clone https://github.com/SammaelA/SdfTaskTemplate.git
-    cd SdfTaskTemplate
-    git submodule update --init
-
 Install SDF (Ubuntu 22)
 
     sudo apt-get install libsdl2-2.0-0
@@ -20,20 +14,31 @@ Build the executable:
 
 ## Execute
 
-    ./render
+Primitives rendering (A1, A4, A5):
 
-Template visualizes one layer of an SDF grid (example_grid.bin, mode of a bunny)  
-use W and S keys to swich between layers.
+    ./render render primitives
 
-## Contents
+Naive mesh rendering (A2):
 
-This repository contains several things useful for working on the task.
+    ./render render mesh_naive "input.obj"
 
-- Small maths library with vertices, matrices and a set of useful functions (LiteMath/LiteMath.h)
-- Functions for saving and loading images (LiteMath/Image2d.h)
-- SimpleMesh, data structure to store triangle mesh, and functions to load it from .obj files (mesh.h)
-- Data structures for SDF grid and octree, functions to save and load them (main.cpp)
-- A template for your application: creating window with SDF, handling keyboard input, rendering to the window (main.cpp)
-- A set of test meshes (cube.obj, as1-oc-214.obj, MotorcycleCylinderHead.obj, spot.obj, stanford-bunny.obj)
-  All these models are watertight and can be converted to SDF without issues
-- A set of test SDFs (example_grid.grid, example_grid_large.grid, example_octree_large.octree)
+    ./render render mesh_naive cube.obj
+
+SDFGrid rendering (B1):
+
+    ./render render grid "input.grid"
+
+    ./render render grid example_grid.grid
+
+## Rendering Camera Movement
+- WASD - move around
+- QE - go up/down
+- MOUSE - look around
+
+## Tasks Done:
+1. A1. Рендер плоскости, заданной уравнением
+2. A2. Рендер треугольного меша (наивный)
+3. A4. Тени
+4. A5. Зеркальные отражения
+5. B1. Рендер модели, представленной SDFGrid
+6. B2. Построение регулярной сетки по мешу
